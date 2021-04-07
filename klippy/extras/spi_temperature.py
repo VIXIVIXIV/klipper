@@ -276,7 +276,7 @@ class MAX31865(SensorBase):
         rtd_nominal_r = config.getfloat('rtd_nominal_r', 100., above=0.)
         rtd_reference_r = config.getfloat('rtd_reference_r', 430., above=0.)
         #Extra wire resistance, calibrate to 0C ice bath
-        rtd_inline_r = config.getfloat('rtd_inline_r', 0., minval=0.)
+        self.rtd_inline_r = config.getfloat('rtd_inline_r', 0., minval=0.)
         adc_to_resist = rtd_reference_r / float(MAX31865_ADC_MAX)
         self.adc_to_resist_div_nominal = adc_to_resist / rtd_nominal_r
         SensorBase.__init__(self, config, "MAX31865",
