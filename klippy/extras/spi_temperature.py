@@ -279,7 +279,7 @@ class MAX31865(SensorBase):
         rtd_inline_r = config.getfloat('rtd_inline_r', 0., minval=0.)
         adc_to_resist = rtd_reference_r / float(MAX31865_ADC_MAX)
         self.adc_to_resist_div_nominal = adc_to_resist / rtd_nominal_r
-		self.correction_factor = rtd_inline_r / rtd_nominal_r
+        self.correction_factor = rtd_inline_r / rtd_nominal_r
         SensorBase.__init__(self, config, "MAX31865",
                             self.build_spi_init(config))
     def calc_temp(self, adc, fault):
