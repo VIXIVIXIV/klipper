@@ -24,6 +24,7 @@ class ControllerFan:
         self.heater_name = config.get("heater", "extruder")
         self.last_on = self.idle_timeout
         self.last_speed = 0.
+        self.use_heater = config.getboolean("use_heater", "true")
     def handle_ready(self):
         pheaters = self.printer.lookup_object('heaters')
         self.heaters = [pheaters.lookup_heater(n.strip())
@@ -41,7 +42,7 @@ class ControllerFan:
             active |= self.stepper_enable.lookup_enable(name).is_motor_enabled()
         for heater in self.heaters:
             _, target_temp = heater.get_temp(eventtime)
-            if target_temp:
+            if target_temp and self.use_heater:
                 active = True
         if active:
             self.last_on = 0

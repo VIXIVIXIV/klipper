@@ -7,9 +7,9 @@
 #include "board/armcm_boot.h" // armcm_enable_irq
 #include "autoconf.h" // CONFIG_T5UID1_SERIAL_PORT
 #include "board/irq.h" // irq_save
-#include "board/t5uid1_irq.h" // t5uid1_rx_byte
+#include "board/t5uid1/serial_irq.h" // t5uid1_rx_byte
 #include "command.h" // DECL_CONSTANT_STR
-#include "internal.h" // gpio_peripheral
+#include "../internal.h" // gpio_peripheral
 
 #if CONFIG_SERIAL && CONFIG_T5UID1_SERIAL_PORT == 0
   #error "The serial port selected for the T5UID1 screen is already used"
@@ -64,7 +64,7 @@ kick_tx(void)
 }
 
 void
-UARTx_IRQHandler(void)
+t5uid1_UARTx_IRQHandler(void)
 {
     uint32_t iir = LPC_UARTx->IIR, status = iir & 0x0f;
     if (status == 0x04)
@@ -104,6 +104,6 @@ t5uid1_init(uint32_t baud)
     gpio_peripheral(GPIO_Tx, UARTx_FUNC, 0);
 
     // Enable receive irq
-    armcm_enable_irq(UARTx_IRQHandler, UARTx_IRQn, 0);
+    armcm_enable_irq(t5uid1_UARTx_IRQHandler, UARTx_IRQn, 0);
     LPC_UARTx->IER = 0x01;
 }
