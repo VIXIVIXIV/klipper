@@ -322,6 +322,15 @@ The following information is available in the `toolhead` object
   the printer had to be paused because the toolhead moved faster than
   moves could be read from the G-Code input.
 
+# dual_carriage
+
+The following information is available in
+[dual_carriage](Config_Reference.md#dual_carriage)
+on a hybrid_corexy or hybrid_corexz robot
+- `mode`: The current mode. Possible values are: "FULL_CONTROL"
+- `active_carriage`: The current active carriage.
+Possible values are: "CARRIAGE_0", "CARRIAGE_1"
+
 # virtual_sdcard
 
 The following information is available in the
@@ -329,7 +338,9 @@ The following information is available in the
 - `is_active`: Returns True if a print from file is currently active.
 - `progress`: An estimate of the current print progress (based of file
   size and file position).
+- `file_path`: A full path to the file of currently loaded file.
 - `file_position`: The current position (in bytes) of an active print.
+- `file_size`: The file size (in bytes) of currently loaded file.
 
 # webhooks
 
