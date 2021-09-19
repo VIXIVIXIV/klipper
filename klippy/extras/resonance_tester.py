@@ -4,7 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math, os, time
-from . import shaper_calibrate
+from . import shaper_calibrate, adxl345_simulated
 
 def _parse_probe_points(config):
     points = config.get('probe_points').split('\n')
@@ -15,10 +15,49 @@ def _parse_probe_points(config):
         raise config.error("Unable to parse probe_points in %s" % (
             config.get_name()))
 
-class VibrationPulseTest:
+class TestAxis:
+    def __init__(self, axis=None, vib_dir=None):
+        if axis is None:
+            self._name = "axis=%.3f,%.3f" % (vib_dir[0], vib_dir[1])
+        else:
+            self._name = axis
+        if vib_dir is None:
+            self._vib_dir = (1., 0.) if axis == 'x' else (0., 1.)
+        else:
+            s = math.sqrt(sum([d*d for d in vib_dir]))
+            self._vib_dir = [d / s for d in vib_dir]
+    def matches(self, chip_axis):
+        if self._vib_dir[0] and 'x' in chip_axis:
+            return True
+        if self._vib_dir[1] and 'y' in chip_axis:
+            return True
+        return False
+    def get_name(self):
+        return self._name
+    def get_point(self, l):
+        return (self._vib_dir[0] * l, self._vib_dir[1] * l)
+
+def _parse_axis(gcmd, raw_axis):
+    if raw_axis is None:
+        return None
+    raw_axis = raw_axis.lower()
+    if raw_axis in ['x', 'y']:
+        return TestAxis(axis=raw_axis)
+    dirs = raw_axis.split(',')
+    if len(dirs) != 2:
+        raise gcmd.error("Invalid format of axis '%s'" % (raw_axis,))
+    try:
+        dir_x = float(dirs[0].strip())
+        dir_y = float(dirs[1].strip())
+    except:
+        raise gcmd.error(
+                "Unable to parse axis direction '%s'" % (raw_axis,))
+    return TestAxis(vib_dir=(dir_x, dir_y))
+
+class VibrationsTest:
     def __init__(self, config):
-        printer = config.get_printer()
-        self.gcode = printer.lookup_object('gcode')
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
         self.min_freq = config.getfloat('min_freq', 5., minval=1.)
         # Defaults are such that max_freq * accel_per_hz == 10000 (max_accel)
         self.max_freq = config.getfloat('max_freq', 10000. / 75.,
@@ -28,53 +67,206 @@ class VibrationPulseTest:
                                           minval=0.1, maxval=2.)
 
         self.probe_points = _parse_probe_points(config)
-    def get_supported_axes(self):
-        return ['x', 'y']
     def get_start_test_points(self):
         return self.probe_points
-    def prepare_test(self, toolhead, gcmd):
+    def prepare_test(self, gcmd):
         self.freq_start = gcmd.get_float("FREQ_START", self.min_freq, minval=1.)
         self.freq_end = gcmd.get_float("FREQ_END", self.max_freq,
                                        minval=self.freq_start, maxval=200.)
         self.hz_per_sec = gcmd.get_float("HZ_PER_SEC", self.hz_per_sec,
                                          above=0., maxval=2.)
-        # Attempt to adjust maximum acceleration and acceleration to
-        # deceleration based on the maximum test frequency.
-        max_accel = self.freq_end * self.accel_per_hz
-        toolhead.cmd_SET_VELOCITY_LIMIT(self.gcode.create_gcode_command(
-            "SET_VELOCITY_LIMIT", "SET_VELOCITY_LIMIT",
-            {"ACCEL": max_accel, "ACCEL_TO_DECEL": max_accel}))
-    def run_test(self, toolhead, axis, gcmd):
+    def run_test(self, axis, gcmd):
+        toolhead = self.printer.lookup_object('toolhead')
         X, Y, Z, E = toolhead.get_position()
-        if axis not in self.get_supported_axes():
-            raise gcmd.error("Test axis '%s' is not supported", axis)
-        vib_dir = (1, 0) if axis == 'x' else (0., 1.)
         sign = 1.
         freq = self.freq_start
+        # Override maximum acceleration and acceleration to
+        # deceleration based on the maximum test frequency
+        max_accel = self.freq_end * self.accel_per_hz
+        self.gcode.run_script_from_command(
+                "SET_VELOCITY_LIMIT ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
+                    max_accel, max_accel))
         gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
-        _, max_accel = toolhead.get_max_velocity()
+        old_l = 0.
+        max_v = .25 * self.accel_per_hz
         while freq <= self.freq_end + 0.000001:
-            t_seg = .25 / freq
-            accel = min(self.accel_per_hz * freq, max_accel)
-            V = accel * t_seg
+            half_period = .5 / freq
+            accel = self.accel_per_hz * freq
+            l = max_v * max_v / accel - old_l
             toolhead.cmd_M204(self.gcode.create_gcode_command(
                 "M204", "M204", {"S": accel}))
-            L = .5 * accel * t_seg**2
-            nX = X + sign * vib_dir[0] * L
-            nY = Y + sign * vib_dir[1] * L
-            toolhead.move([nX, nY, Z, E], V)
-            toolhead.move([X, Y, Z, E], V)
+            dX, dY = axis.get_point(l)
+            nX = X + sign * dX
+            nY = Y + sign * dY
+            toolhead.move([nX, nY, Z, E], max_v)
             sign = -sign
             old_freq = freq
-            freq += 2. * t_seg * self.hz_per_sec
+            old_l = l
+            freq += half_period * self.hz_per_sec
             if math.floor(freq) > math.floor(old_freq):
                 gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
+        toolhead.move([X, Y, Z, E], max_v)
+    def finalize_data(self, helper, axis, data):
+        data.normalize_to_frequencies()
+
+class PulsesTest:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.simulated_accelerometer = adxl345_simulated.ADXL345Simulated(
+                config=None, printer=self.printer)
+        self.multiplicity = config.getint('multiplicity', 10)
+        self.max_freq = config.getfloat('max_freq', 100., maxval=200.)
+        self.min_freq = config.getfloat('min_freq', 10., above=0.)
+        self.hz_per_sec = config.getfloat('hz_per_sec', 1.,
+                                          minval=0.1, maxval=2.)
+        self.max_accel = config.getfloat('max_accel', 10000., above=0.)
+        self.speed = config.getfloat('test_speed', self.max_accel/1000.,
+                                     minval=self.max_accel/1600.)
+        self.probe_points = _parse_probe_points(config)
+    def get_start_test_points(self):
+        return self.probe_points
+    def prepare_test(self, gcmd):
+        self.freq_end = gcmd.get_float("FREQ_END", self.max_freq, maxval=200.)
+        self.freq_start = gcmd.get_float("FREQ_START", self.min_freq, above=0.)
+        self.hz_per_sec = gcmd.get_float("HZ_PER_SEC", self.hz_per_sec,
+                                         above=0., maxval=2.)
+        self.test_speed = gcmd.get_float("TEST_SPEED", self.speed, above=0.)
+        self.max_test_accel = gcmd.get_float("MAX_ACCEL", self.max_accel,
+                                             above=0.)
+        self.simulated_results = {}
+    def run_test(self, axis, gcmd):
+        accelerometer = self.simulated_accelerometer
+        accelerometer.start_measurements()
+        toolhead = self.printer.lookup_object('toolhead')
+        X, Y, Z, E = toolhead.get_position()
+        sign = 1.
+        freq = self.freq_start
+        accel = self.max_test_accel
+        max_v = self.test_speed
+        accel_t = max_v / accel
+        self.gcode.run_script_from_command(
+                "SET_VELOCITY_LIMIT ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
+                    accel, accel))
+        old_percent = 0
+        old_l = 0.
+        while freq <= self.freq_end + 0.000001:
+            half_period = .5 / freq * self.multiplicity
+            if half_period < 2. * accel_t:
+                break
+            l = accel * accel_t**2 + max_v * (half_period - 2.*accel_t) - old_l
+            dX, dY = axis.get_point(l)
+            nX = X + sign * dX
+            nY = Y + sign * dY
+            toolhead.move([nX, nY, Z, E], max_v)
+            sign = -sign
+            old_freq = freq
+            old_l = l
+            freq += half_period * self.hz_per_sec
+            percent = math.floor((freq - self.freq_start) * 100. /
+                                 (self.freq_end - self.freq_start))
+            if percent != old_percent:
+                gcmd.respond_info("Test progress %d %%" % (percent,))
+            old_percent = percent
+        toolhead.move([X, Y, Z, E], max_v)
+        self.simulated_results[axis] = accelerometer.finish_measurements()
+    def finalize_data(self, helper, axis, data):
+        if axis not in self.simulated_results:
+            return
+        simulated_data = helper.process_accelerometer_data(
+                self.simulated_results[axis])
+        data.subtract(simulated_data)
+
+class MovesTest:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.simulated_accelerometer = adxl345_simulated.ADXL345Simulated(
+                config=None, printer=self.printer)
+        self.probe_points = _parse_probe_points(config)
+        self.order = order = config.getint('order', 1, minval=0, maxval=8)
+        self.runs = config.getint('runs', 5, minval=1)
+        self.max_speed = config.getfloat('max_speed')
+        self.max_accel = config.getfloat('max_accel')
+        self.radius = config.getfloat('radius')
+        self.prepare_moves()
+    def get_start_test_points(self):
+        return self.probe_points
+    def prepare_moves(self):
+        order = self.order
+        self.l = l = self.radius / 3**order
+        state = [0., 1]  # first is position, second is direction
+        moves = []
+        def turn():
+            state[1] = -state[1]
+            moves.append(0)
+        def move(order):
+            if not order:
+                moves.append(state[1] * l)
+                return
+            move(order-1)
+            move(order-1)
+            turn()
+            move(order-1)
+            turn()
+            move(order-1)
+            move(order-1)
+        move(order)
+        turn()
+        move(order)
+        move(order)
+        turn()
+        move(order)
+        self.moves = moves
+    def prepare_test(self, gcmd):
+        self.max_test_speed = gcmd.get_float("MAX_SPEED", self.max_speed)
+        self.max_test_accel = gcmd.get_float("MAX_ACCEL", self.max_accel)
+        self.simulated_results = {}
+    def run_test(self, axis, gcmd):
+        accelerometer = self.simulated_accelerometer
+        accelerometer.start_measurements()
+        toolhead = self.printer.lookup_object('toolhead')
+        X, Y, Z, E = toolhead.get_position()
+        self.gcode.run_script_from_command(
+                "SET_VELOCITY_LIMIT VELOCITY=%.3f ACCEL=%.3f"
+                " ACCEL_TO_DECEL=%.3f" % (self.max_test_speed,
+                                          self.max_test_accel,
+                                          self.max_test_accel))
+        wait = 2 * self.l / self.max_test_speed
+        old_percent = 0
+        n = len(self.moves)
+        for i in range(self.runs):
+            velocity = self.max_test_speed * .5 * ((i + 1.) / self.runs + 1)
+            for j, move in enumerate(self.moves):
+                dX, dY = axis.get_point(move)
+                nX = X + dX
+                nY = Y + dY
+                if not move:
+                    toolhead.dwell(wait)
+                else:
+                    toolhead.move([nX, nY, Z, E], velocity)
+                X, Y = nX, nY
+                percent = math.floor((j + 1 + i * n) * 100. / (n * self.runs))
+                if percent != old_percent:
+                    gcmd.respond_info("Test progress %d %%" % (percent,))
+                old_percent = percent
+        self.simulated_results[axis] = accelerometer.finish_measurements()
+    def finalize_data(self, helper, axis, data):
+        if axis not in self.simulated_results:
+            return
+        simulated_data = helper.process_accelerometer_data(
+                self.simulated_results[axis])
+        data.subtract(simulated_data)
 
 class ResonanceTester:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.move_speed = config.getfloat('move_speed', 50., above=0.)
-        self.test = VibrationPulseTest(config)
+        test_methods = {'vibrations': VibrationsTest,
+                        'pulses': PulsesTest,
+                        'moves': MovesTest}
+        test_method = config.getchoice('method', test_methods, 'vibrations')
+        self.test = test_method(config)
         if not config.get('accel_chip_x', None):
             self.accel_chip_names = [('xy', config.get('accel_chip').strip())]
         else:
@@ -87,28 +279,103 @@ class ResonanceTester:
 
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command("MEASURE_AXES_NOISE",
-                                    self.cmd_MEASURE_AXES_NOISE)
+                                    self.cmd_MEASURE_AXES_NOISE,
+                                    desc=self.cmd_MEASURE_AXES_NOISE_help)
         self.gcode.register_command("TEST_RESONANCES",
-                                    self.cmd_TEST_RESONANCES)
+                                    self.cmd_TEST_RESONANCES,
+                                    desc=self.cmd_TEST_RESONANCES_help)
         self.gcode.register_command("SHAPER_CALIBRATE",
-                                    self.cmd_SHAPER_CALIBRATE)
+                                    self.cmd_SHAPER_CALIBRATE,
+                                    desc=self.cmd_SHAPER_CALIBRATE_help)
         self.printer.register_event_handler("klippy:connect", self.connect)
 
     def connect(self):
         self.accel_chips = [
-                (axis, self.printer.lookup_object(chip_name))
-                for axis, chip_name in self.accel_chip_names]
+                (chip_axis, self.printer.lookup_object(chip_name))
+                for chip_axis, chip_name in self.accel_chip_names]
 
-    def cmd_TEST_RESONANCES(self, gcmd):
+    def _run_test(self, gcmd, axes, helper, raw_name_suffix=None):
         toolhead = self.printer.lookup_object('toolhead')
+        calibration_data = {axis: None for axis in axes}
+
+        self.test.prepare_test(gcmd)
+        test_points = self.test.get_start_test_points()
+        for point in test_points:
+            toolhead.manual_move(point, self.move_speed)
+            if len(test_points) > 1:
+                gcmd.respond_info(
+                        "Probing point (%.3f, %.3f, %.3f)" % tuple(point))
+            for axis in axes:
+                toolhead.wait_moves()
+                toolhead.dwell(0.500)
+                if len(axes) > 1:
+                    gcmd.respond_info("Testing axis %s" % axis.get_name())
+
+                # Store the original parameters
+                systime = self.printer.get_reactor().monotonic()
+                toolhead_info = toolhead.get_status(systime)
+                old_max_velocity = toolhead_info['max_velocity']
+                old_max_accel = toolhead_info['max_accel']
+                old_max_accel_to_decel = toolhead_info['max_accel_to_decel']
+                input_shaper = self.printer.lookup_object('input_shaper', None)
+                # Disable input shaping as appropriate
+                if input_shaper is not None and not gcmd.get_int(
+                        'INPUT_SHAPING', 0):
+                    input_shaper.disable_shaping()
+                    gcmd.respond_info(
+                            "Disabled [input_shaper] for resonance testing")
+                else:
+                    input_shaper = None
+                # Start acceleration measurements
+                for chip_axis, chip in self.accel_chips:
+                    if axis.matches(chip_axis):
+                        chip.start_measurements()
+                # Generate moves
+                self.test.run_test(axis, gcmd)
+                # Restore the original velocity limits
+                self.gcode.run_script_from_command(
+                        "SET_VELOCITY_LIMIT VELOCITY=%.3f ACCEL=%.3f"
+                        " ACCEL_TO_DECEL=%.3f" % (old_max_velocity,
+                                                  old_max_accel,
+                                                  old_max_accel_to_decel))
+                # Restore input shaper if it was disabled for resonance testing
+                if input_shaper is not None:
+                    input_shaper.enable_shaping()
+                    gcmd.respond_info("Re-enabled [input_shaper]")
+                # Obtain the measurement results
+                raw_values = []
+                for chip_axis, chip in self.accel_chips:
+                    if axis.matches(chip_axis):
+                        results = chip.finish_measurements()
+                        if raw_name_suffix is not None:
+                            raw_name = self.get_filename(
+                                    'raw_data', raw_name_suffix, axis,
+                                    point if len(test_points) > 1 else None)
+                            results.write_to_file(raw_name)
+                            gcmd.respond_info(
+                                    "Writing raw accelerometer data to "
+                                    "%s file" % (raw_name,))
+                        raw_values.append((chip_axis, results))
+                        gcmd.respond_info("%s-axis accelerometer stats: %s" % (
+                            chip_axis, results.get_stats(),))
+                if helper is None:
+                    continue
+                for chip_axis, chip_values in raw_values:
+                    if not chip_values:
+                        raise gcmd.error(
+                                "%s-axis accelerometer measured no data" % (
+                                    chip_axis,))
+                    new_data = helper.process_accelerometer_data(chip_values)
+                    self.test.finalize_data(helper, axis, new_data)
+                    if calibration_data[axis] is None:
+                        calibration_data[axis] = new_data
+                    else:
+                        calibration_data[axis].add_data(new_data)
+        return calibration_data
+    cmd_TEST_RESONANCES_help = ("Runs the resonance test for a specifed axis")
+    def cmd_TEST_RESONANCES(self, gcmd):
         # Parse parameters
-        self.test.prepare_test(toolhead, gcmd)
-        if len(self.test.get_supported_axes()) > 1:
-            axis = gcmd.get("AXIS").lower()
-        else:
-            axis = gcmd.get("AXIS", self.test.get_supported_axes()[0]).lower()
-        if axis not in self.test.get_supported_axes():
-            raise gcmd.error("Unsupported axis '%s'" % (axis,))
+        axis = _parse_axis(gcmd, gcmd.get("AXIS").lower())
 
         outputs = gcmd.get("OUTPUT", "resonances").lower().split(',')
         for output in outputs:
@@ -127,79 +394,28 @@ class ResonanceTester:
         # Setup calculation of resonances
         if csv_output:
             helper = shaper_calibrate.ShaperCalibrate(self.printer)
-
-        input_shaper = self.printer.lookup_object('input_shaper', None)
-        if input_shaper is not None and not gcmd.get_int('INPUT_SHAPING', 0):
-            input_shaper.disable_shaping()
-            gcmd.respond_info("Disabled [input_shaper] for resonance testing")
         else:
-            input_shaper = None
+            helper = None
 
-        currentPos = toolhead.get_position()
-        Z = currentPos[2]
-        E = currentPos[3]
-
-        calibration_points = self.test.get_start_test_points()
-        data = None
-        for point in calibration_points:
-            toolhead.manual_move(point, self.move_speed)
-            if len(calibration_points) > 1:
-                gcmd.respond_info(
-                        "Probing point (%.3f, %.3f, %.3f)" % tuple(point))
-            toolhead.wait_moves()
-            toolhead.dwell(0.500)
-            gcmd.respond_info("Testing axis %s" % axis.upper())
-
-            for chip_axis, chip in self.accel_chips:
-                if axis in chip_axis or chip_axis in axis:
-                    chip.start_measurements()
-            # Generate moves
-            self.test.run_test(toolhead, axis, gcmd)
-            raw_values = []
-            for chip_axis, chip in self.accel_chips:
-                if axis in chip_axis or chip_axis in axis:
-                    results = chip.finish_measurements()
-                    if raw_output:
-                        raw_name = self.get_filename(
-                                'raw_data', name_suffix, axis,
-                                point if len(calibration_points) > 1 else None)
-                        results.write_to_file(raw_name)
-                        gcmd.respond_info(
-                                "Writing raw accelerometer data to %s file" % (
-                                    raw_name,))
-                    raw_values.append((chip_axis, results))
-            if not csv_output:
-                continue
-            for chip_axis, chip_values in raw_values:
-                gcmd.respond_info("%s-axis accelerometer stats: %s" % (
-                    chip_axis, chip_values.get_stats(),))
-                if not chip_values:
-                    raise gcmd.error(
-                            "%s-axis accelerometer measured no data" % (
-                                chip_axis,))
-                new_data = helper.process_accelerometer_data(chip_values)
-                data = data.join(new_data) if data else new_data
+        data = self._run_test(
+                gcmd, [axis], helper,
+                raw_name_suffix=name_suffix if raw_output else None)[axis]
         if csv_output:
             csv_name = self.save_calibration_data('resonances', name_suffix,
                                                   helper, axis, data)
             gcmd.respond_info(
                     "Resonances data written to %s file" % (csv_name,))
-        if input_shaper is not None:
-            input_shaper.enable_shaping()
-            gcmd.respond_info(
-                    "Re-enabled [input_shaper] after resonance testing")
-
+    cmd_SHAPER_CALIBRATE_help = (
+        "Simular to TEST_RESONANCES but suggest input shaper config")
     def cmd_SHAPER_CALIBRATE(self, gcmd):
-        toolhead = self.printer.lookup_object('toolhead')
         # Parse parameters
-        self.test.prepare_test(toolhead, gcmd)
         axis = gcmd.get("AXIS", None)
         if not axis:
-            calibrate_axes = self.test.get_supported_axes()
-        elif axis.lower() not in self.test.get_supported_axes():
+            calibrate_axes = [TestAxis('x'), TestAxis('y')]
+        elif axis.lower() not in 'xy':
             raise gcmd.error("Unsupported axis '%s'" % (axis,))
         else:
-            calibrate_axes = [axis.lower()]
+            calibrate_axes = [TestAxis(axis.lower())]
 
         max_smoothing = gcmd.get_float(
                 "MAX_SMOOTHING", self.max_smoothing, minval=0.05)
@@ -211,91 +427,48 @@ class ResonanceTester:
         # Setup shaper calibration
         helper = shaper_calibrate.ShaperCalibrate(self.printer)
 
-        input_shaper = self.printer.lookup_object('input_shaper', None)
-        if input_shaper is not None:
-            input_shaper.disable_shaping()
-            gcmd.respond_info("Disabled [input_shaper] for calibration")
-
-        currentPos = toolhead.get_position()
-        Z = currentPos[2]
-        E = currentPos[3]
-        calibration_data = {axis: None for axis in calibrate_axes}
-
-        calibration_points = self.test.get_start_test_points()
-        for point in calibration_points:
-            toolhead.manual_move(point, self.move_speed)
-            if len(calibration_points) > 1:
-                gcmd.respond_info(
-                        "Probing point (%.3f, %.3f, %.3f)" % tuple(point))
-            for axis in calibrate_axes:
-                toolhead.wait_moves()
-                toolhead.dwell(0.500)
-                gcmd.respond_info("Testing axis %s" % axis.upper())
-
-                for chip_axis, chip in self.accel_chips:
-                    if axis in chip_axis or chip_axis in axis:
-                        chip.start_measurements()
-                # Generate moves
-                self.test.run_test(toolhead, axis, gcmd)
-                raw_values = [(chip_axis, chip.finish_measurements())
-                              for chip_axis, chip in self.accel_chips
-                              if axis in chip_axis or chip_axis in axis]
-                for chip_axis, chip_values in raw_values:
-                    gcmd.respond_info("%s-axis accelerometer stats: %s" % (
-                        chip_axis, chip_values.get_stats(),))
-                    if not chip_values:
-                        raise gcmd.error(
-                                "%s-axis accelerometer measured no data" % (
-                                    chip_axis,))
-                    new_data = helper.process_accelerometer_data(chip_values)
-                    if calibration_data[axis] is None:
-                        calibration_data[axis] = new_data
-                    else:
-                        calibration_data[axis].join(new_data)
+        calibration_data = self._run_test(gcmd, calibrate_axes, helper)
 
         configfile = self.printer.lookup_object('configfile')
-
         for axis in calibrate_axes:
+            axis_name = axis.get_name()
             gcmd.respond_info(
                     "Calculating the best input shaper parameters for %s axis"
-                    % (axis,))
-            calibration_data[axis].normalize_to_frequencies()
+                    % (axis_name,))
             best_shaper, all_shapers = helper.find_best_shaper(
                     calibration_data[axis], max_smoothing, gcmd.respond_info)
             gcmd.respond_info(
                     "Recommended shaper_type_%s = %s, shaper_freq_%s = %.1f Hz"
-                    % (axis, best_shaper.name, axis, best_shaper.freq))
-            helper.save_params(configfile, axis,
+                    % (axis_name, best_shaper.name,
+                       axis_name, best_shaper.freq))
+            helper.save_params(configfile, axis_name,
                                best_shaper.name, best_shaper.freq)
             csv_name = self.save_calibration_data(
                     'calibration_data', name_suffix, helper, axis,
                     calibration_data[axis], all_shapers)
             gcmd.respond_info(
                     "Shaper calibration data written to %s file" % (csv_name,))
-
         gcmd.respond_info(
             "The SAVE_CONFIG command will update the printer config file\n"
             "with these parameters and restart the printer.")
-        if input_shaper is not None:
-            input_shaper.enable_shaping()
-            gcmd.respond_info("Re-enabled [input_shaper] after calibration")
-
+    cmd_MEASURE_AXES_NOISE_help = (
+        "Measures noise of all enabled accelerometer chips")
     def cmd_MEASURE_AXES_NOISE(self, gcmd):
         meas_time = gcmd.get_float("MEAS_TIME", 2.)
         for _, chip in self.accel_chips:
             chip.start_measurements()
         self.printer.lookup_object('toolhead').dwell(meas_time)
-        raw_values = [(axis, chip.finish_measurements())
-                      for axis, chip in self.accel_chips]
+        raw_values = [(chip_axis, chip.finish_measurements())
+                      for chip_axis, chip in self.accel_chips]
         helper = shaper_calibrate.ShaperCalibrate(self.printer)
-        for axis, raw_data in raw_values:
+        for chip_axis, raw_data in raw_values:
             data = helper.process_accelerometer_data(raw_data)
             vx = data.psd_x.mean()
             vy = data.psd_y.mean()
             vz = data.psd_z.mean()
             gcmd.respond_info("Axes noise for %s-axis accelerometer: "
                               "%.6f (x), %.6f (y), %.6f (z)" % (
-                                  axis, vx, vy, vz))
+                                  chip_axis, vx, vy, vz))
 
     def is_valid_name_suffix(self, name_suffix):
         return name_suffix.replace('-', '').replace('_', '').isalnum()
@@ -303,7 +476,7 @@ class ResonanceTester:
     def get_filename(self, base, name_suffix, axis=None, point=None):
         name = base
         if axis:
-            name += '_' + axis
+            name += '_' + axis.get_name()
         if point:
             name += "_%.3f_%.3f_%.3f" % (point[0], point[1], point[2])
         name += '_' + name_suffix
