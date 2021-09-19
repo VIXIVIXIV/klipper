@@ -25,14 +25,9 @@ def parse_log(logname):
             return np.loadtxt(logname, comments='#', delimiter=',')
     # Parse power spectral density data
     data = np.loadtxt(logname, skiprows=1, comments='#', delimiter=',')
-    calibration_data = CalibrationData(
-            freq_bins=data[:,0], psd_sum=data[:,4],
-            psd_x=data[:,1], psd_y=data[:,2], psd_z=data[:,3])
+    calibration_data = CalibrationData(freq_bins=data[:,0], psd_x=data[:,1],
+                                       psd_y=data[:,2], psd_z=data[:,3])
     calibration_data.set_numpy(np)
-    # If input shapers are present in the CSV file, the frequency
-    # response is already normalized to input frequencies
-    if 'mzv' not in header:
-        calibration_data.normalize_to_frequencies()
     return calibration_data
 
 ######################################################################
@@ -51,7 +46,6 @@ def calibrate_shaper(datas, csv_output, max_smoothing):
         calibration_data = helper.process_accelerometer_data(datas[0])
         for data in datas[1:]:
             calibration_data.add_data(helper.process_accelerometer_data(data))
-        calibration_data.normalize_to_frequencies()
     shaper, all_shapers = helper.find_best_shaper(
             calibration_data, max_smoothing, print)
     print("Recommended shaper is %s @ %.1f Hz" % (shaper.name, shaper.freq))
@@ -139,7 +133,7 @@ def main():
                     default=None, help="filename of output graph")
     opts.add_option("-c", "--csv", type="string", dest="csv",
                     default=None, help="filename of output csv file")
-    opts.add_option("-f", "--max_freq", type="float", default=200.,
+    opts.add_option("-f", "--max_freq", type="float", default=150.,
                     help="maximum frequency to graph")
     opts.add_option("-s", "--max_smoothing", type="float", default=None,
                     help="maximum shaper smoothing to allow")
