@@ -20,7 +20,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: "Upstream sync",
-              head: "KevinOConnor:master",
+              head: "Klipper3d:master",
               base: "snapshot",
               maintainer_can_modify: false
             })
