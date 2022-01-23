@@ -95,7 +95,7 @@ gcode:
   G90
   G0 Z15 F300
   {% for wipe in range(wipe_count) %}
-    {% for coordinate in [(275,4),(235,4)] %}
+    {% for coordinate in [(275, 4),(235, 4)] %}
       G0 X{coordinate[0]} Y{coordinate[1] + 0.25 * wipe} Z9.7 F12000
     {% endfor %}
   {% endfor %}
@@ -127,6 +127,20 @@ parameter and assign the result to a local name. For example:
 gcode:
   {% set bed_temp = params.TEMPERATURE|default(40)|float %}
   M140 S{bed_temp}
+```
+
+### The "rawparams" variable
+
+The full unparsed parameters for the running macro can be access via the `rawparams` pseudo-variable.
+
+This is quite useful if you want to change the behavior of certain commands like the `M117`. For example:
+
+```
+[gcode_macro M117]
+rename_existing: M117.1
+gcode:
+  M117.1 { rawparams }
+  M118 { rawparams }
 ```
 
 ### The "printer" Variable
