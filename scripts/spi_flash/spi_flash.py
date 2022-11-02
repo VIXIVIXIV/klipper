@@ -13,8 +13,10 @@ import logging
 import collections
 import time
 import traceback
+import json
 import board_defs
 import fatfs_lib
+import util
 import reactor
 import serialhdl
 import clocksync
@@ -93,13 +95,19 @@ def check_need_convert(board_name, config):
 
 SPI_OID = 0
 SPI_MODE = 0
-SD_SPI_SPEED = 4000000
+SD_SPI_SPEED = 400000
 # MCU Command Constants
 RESET_CMD = "reset"
 GET_CFG_CMD = "get_config"
-GET_CFG_RESPONSE = "config is_config=%c crc=%u move_count=%hu is_shutdown=%c"
+GET_CFG_RESPONSES = ( # Supported responses (sorted by newer revisions first).
+    "config is_config=%c crc=%u is_shutdown=%c move_count=%hu", # d4aee4f
+    "config is_config=%c crc=%u move_count=%hu is_shutdown=%c"  # Original
+)
 ALLOC_OIDS_CMD = "allocate_oids count=%d"
-SPI_CFG_CMD = "config_spi oid=%d pin=%s"
+SPI_CFG_CMDS = (
+    "config_spi oid=%d pin=%s cs_active_high=%d",   # 7793784
+    "config_spi oid=%d pin=%s"                      # Original
+)
 SPI_BUS_CMD = "spi_set_bus oid=%d spi_bus=%s mode=%d rate=%d"
 SW_SPI_BUS_CMD = "spi_set_software_bus oid=%d " \
     "miso_pin=%s mosi_pin=%s sclk_pin=%s mode=%d rate=%d"
@@ -109,6 +117,9 @@ SPI_XFER_RESPONSE = "spi_transfer_response oid=%c response=%*s"
 FINALIZE_CFG_CMD = "finalize_config crc=%d"
 
 class SPIFlashError(Exception):
+    pass
+
+class MCUConfigError(SPIFlashError):
     pass
 
 class SPIDirect:
@@ -273,7 +284,7 @@ class FatFS:
 
     def remove_item(self, sd_path):
         # Can be path to directory or file
-        ret = self.ffi_lib.fatfs_remove(sd_path)
+        ret = self.ffi_lib.fatfs_remove(sd_path.encode())
         if ret != 0:
             raise OSError("flash_sdcard: Error deleting item at path '%s',"
                           " result: %s"
@@ -281,7 +292,7 @@ class FatFS:
 
     def get_file_info(self, sd_file_path):
         finfo = self.ffi_main.new("struct ff_file_info *")
-        ret = self.ffi_lib.fatfs_get_fstats(finfo, sd_file_path)
+        ret = self.ffi_lib.fatfs_get_fstats(finfo, sd_file_path.encode())
         if ret != 0:
             raise OSError(
                 "flash_sdcard: Failed to retreive file info for path '%s',"
@@ -291,7 +302,7 @@ class FatFS:
 
     def list_sd_directory(self, sd_dir_path):
         flist = self.ffi_main.new("struct ff_file_info[128]")
-        ret = self.ffi_lib.fatfs_list_dir(flist, 128, sd_dir_path)
+        ret = self.ffi_lib.fatfs_list_dir(flist, 128, sd_dir_path.encode())
         if ret != 0:
             raise OSError("flash_sdcard: Failed to retreive file list at path"
                           " '%s', result: %s"
@@ -356,7 +367,7 @@ class SDCardFile:
         if self.fhdl is not None:
             # already open
             return
-        self.fhdl = self.ffi_lib.fatfs_open(self.path, self.mode)
+        self.fhdl = self.ffi_lib.fatfs_open(self.path.encode(), self.mode)
         self.eof = False
         if self.fhdl == self.ffi_main.NULL:
             self.fhdl = None
@@ -774,6 +785,13 @@ class SDCardSPI:
             if err_msgs:
                 raise OSError("\n".join(err_msgs))
 
+SDIO_WARNING = """
+This board requires a manual reboot to complete the flash process.
+If the board's bootloader uses SDIO mode for its SDCard, then a full
+power cycle is required.  Please perform the power cycle now and then
+rerun this utility with the 'check' option to verify flash.
+"""
+
 class MCUConnection:
     def __init__(self, k_reactor, device, baud, board_cfg):
         self.reactor = k_reactor
@@ -788,6 +806,8 @@ class MCUConnection:
         self.connect_completion = None
         self.connected = False
         self.enumerations = {}
+        self.raw_dictionary = None
+        self.proto_error = None
 
     def connect(self):
         output("Connecting to MCU..")
@@ -814,6 +834,8 @@ class MCUConnection:
                 "MCU Type mismatch: Build MCU = %s, Connected MCU = %s"
                 % (build_mcu_type, mcu_type))
         self.enumerations = msgparser.get_enumerations()
+        self.raw_dictionary = msgparser.get_raw_data_dictionary()
+        self.proto_error = msgparser.error
 
     def _do_serial_connect(self, eventtime):
         endtime = eventtime + 60.
@@ -850,11 +872,23 @@ class MCUConnection:
         self._serial.disconnect()
         self.connected = False
 
+    def get_mcu_config(self):
+        # Iterate through backwards compatible response strings
+        for response in GET_CFG_RESPONSES:
+            try:
+                get_cfg_cmd = mcu.CommandQueryWrapper(
+                    self._serial, GET_CFG_CMD, response)
+                break
+            except Exception as err:
+                # Raise an exception if we hit the end of the list.
+                if response == GET_CFG_RESPONSES[-1]:
+                    raise err
+                output("Trying fallback...")
+        return get_cfg_cmd.send()
+
     def check_need_restart(self):
         output("Checking Current MCU Configuration...")
-        get_cfg_cmd = mcu.CommandQueryWrapper(
-            self._serial, GET_CFG_CMD, GET_CFG_RESPONSE)
-        params = get_cfg_cmd.send()
+        params = self.get_mcu_config()
         output_line("Done")
         if params['is_config'] or params['is_shutdown']:
             output_line("MCU needs restart: is_config=%d, is_shutdown=%d"
@@ -887,18 +921,30 @@ class MCUConnection:
             bus_cmd = SPI_BUS_CMD % (SPI_OID, bus, SPI_MODE, SD_SPI_SPEED)
         if cs_pin not in pin_enums:
             raise SPIFlashError("Invalid CS Pin: %s" % (cs_pin,))
-        cfg_cmds = [
-            ALLOC_OIDS_CMD % (1),
-            SPI_CFG_CMD % (SPI_OID, cs_pin),
-            bus_cmd,
+        cfg_cmds = [ALLOC_OIDS_CMD % (1,), bus_cmd]
+        self._serial.send(cfg_cmds[0])
+        spi_cfg_cmds = [
+            SPI_CFG_CMDS[0] % (SPI_OID, cs_pin, False),
+            SPI_CFG_CMDS[1] % (SPI_OID, cs_pin),
         ]
-        config_crc = zlib.crc32('\n'.join(cfg_cmds)) & 0xffffffff
-        cfg_cmds.append(FINALIZE_CFG_CMD % (config_crc,))
-        for cmd in cfg_cmds:
-            self._serial.send(cmd)
+        for cmd in spi_cfg_cmds:
+            try:
+                self._serial.send(cmd)
+            except self.proto_error:
+                if cmd == spi_cfg_cmds[-1]:
+                    raise
+            else:
+                cfg_cmds.insert(1, cmd)
+                break
+        self._serial.send(bus_cmd)
+        config_crc = zlib.crc32('\n'.join(cfg_cmds).encode()) & 0xffffffff
+        self._serial.send(FINALIZE_CFG_CMD % (config_crc,))
+        config = self.get_mcu_config()
+        if not config["is_config"] or config["is_shutdown"]:
+            raise MCUConfigError("Failed to configure MCU")
+        printfunc("Initializing SD Card and Mounting file system...")
         self.fatfs = FatFS(self._serial)
         self.reactor.pause(self.reactor.monotonic() + .5)
-        printfunc("Initializing SD Card and Mounting file system...")
         try:
             self.fatfs.mount(printfunc)
         except OSError:
@@ -949,29 +995,68 @@ class MCUConnection:
             % (fw_path, sd_size, sd_chksm))
         return sd_chksm
 
-    def verify_flash(self, req_chksm):
+    def verify_flash(self, req_chksm, old_dictionary, req_dictionary):
+        if bool(self.board_config.get('skip_verify', False)):
+            output_line(SDIO_WARNING)
+            return
         output("Verifying Flash...")
-        cur_fw_sha = hashlib.sha1()
-        cur_fw_path = self.board_config.get('current_firmware_path',
-                                            "FIRMWARE.CUR")
-        try:
-            with self.fatfs.open_file(cur_fw_path, 'r') as sd_f:
-                while True:
-                    buf = sd_f.read(4096)
-                    if not buf:
-                        break
-                    cur_fw_sha.update(buf)
-        except Exception:
-            msg = "Failed to read file %s" % (cur_fw_path,)
-            logging.exception(msg)
-            raise SPIFlashError(msg)
-        cur_fw_chksm = cur_fw_sha.hexdigest().upper()
-        if req_chksm == cur_fw_chksm:
-            output_line("Done")
-            output_line("Firmware Flash Successful")
+        validation_passed = False
+        msgparser = self._serial.get_msgparser()
+        cur_dictionary = msgparser.get_raw_data_dictionary()
+        # If we have a dictionary, check that it matches.
+        if req_dictionary:
+            if cur_dictionary != req_dictionary:
+                raise SPIFlashError("Version Mismatch: Got '%s...', "
+                                    "expected '%s...'"
+                                    % (msgparser.get_version_info()[0],
+                                       json.loads(req_dictionary)['version']))
+            output("Version matched...")
+            validation_passed = True
+        # Otherwise check that the MCU dictionary changed
+        elif cur_dictionary != old_dictionary:
+            output("Version updated...")
+            validation_passed = True
         else:
-            raise SPIFlashError("Checksum Mismatch: Got '%s', expected '%s'"
-                                % (cur_fw_chksm, req_chksm))
+            output("Version unchanged...")
+        # If the version didn't change, look for current firmware to checksum
+        cur_fw_sha = None
+        if not validation_passed:
+            cur_fw_path = self.board_config.get('current_firmware_path',
+                                                "FIRMWARE.CUR")
+            try:
+                with self.fatfs.open_file(cur_fw_path, 'r') as sd_f:
+                    cur_fw_sha = hashlib.sha1()
+                    while True:
+                        buf = sd_f.read(4096)
+                        if not buf:
+                            break
+                        cur_fw_sha.update(buf)
+            except Exception:
+                msg = "Failed to read file %s" % (cur_fw_path,)
+                logging.debug(msg)
+                output("Checksum skipped...")
+            if cur_fw_sha is not None:
+                cur_fw_chksm = cur_fw_sha.hexdigest().upper()
+                if req_chksm == cur_fw_chksm:
+                    validation_passed = True
+                    output("Checksum matched...")
+                else:
+                    raise SPIFlashError("Checksum Mismatch: Got '%s', "
+                                        "expected '%s'"
+                                        % (cur_fw_chksm, req_chksm))
+        if not validation_passed:
+            raise SPIFlashError("Validation failure.")
+        output_line("Done")
+        # Remove firmware file if MCU bootloader failed to rename.
+        if cur_fw_sha is None:
+            try:
+                fw_path = self.board_config.get('firmware_path', "firmware.bin")
+                self.fatfs.remove_item(fw_path)
+                output_line("Found and deleted %s after reset" % (fw_path,))
+            except Exception:
+                pass
+        output_line("Firmware Flash Successful")
+        output_line("Current Firmware: %s" % (msgparser.get_version_info()[0],))
 
 class SPIFlash:
     def __init__(self, args):
@@ -988,6 +1073,16 @@ class SPIFlash:
         self.firmware_checksum = None
         self.task_complete = False
         self.need_upload = True
+        self.need_verify = True
+        self.old_dictionary = None
+        self.new_dictionary = None
+        if args['klipper_dict_path'] is not None:
+            try:
+                with open(args['klipper_dict_path'], 'rb') as dict_f:
+                    self.new_dictionary = dict_f.read(32*1024)
+            except Exception:
+                raise SPIFlashError("Missing or invalid dictionary at '%s'"
+                                    % (args['klipper_dict_path'],))
 
     def _wait_for_reconnect(self):
         output("Waiting for device to reconnect...")
@@ -1008,7 +1103,7 @@ class SPIFlash:
                 raise SPIFlashError("Unable to reconnect")
         output_line("Done")
 
-    def run_reset(self, eventtime):
+    def run_reset_upload(self, eventtime):
         # Reset MCU to default state if necessary
         self.mcu_conn.connect()
         if self.mcu_conn.check_need_restart():
@@ -1018,20 +1113,40 @@ class SPIFlash:
             self.need_upload = False
             self.run_sdcard_upload(eventtime)
 
+    def run_reset_verify(self, eventtime):
+        # Reset MCU to default state if necessary
+        self.mcu_conn.connect()
+        if self.mcu_conn.check_need_restart():
+            self.mcu_conn.reset()
+            self.task_complete = True
+        else:
+            self.need_verify = False
+            self.run_verify(eventtime)
+
     def run_sdcard_upload(self, eventtime):
         # Reconnect and upload
         if not self.mcu_conn.connected:
             self.mcu_conn.connect()
-        self.mcu_conn.configure_mcu(printfunc=output_line)
+        self.old_dictionary = self.mcu_conn.raw_dictionary
+        try:
+            self.mcu_conn.configure_mcu(printfunc=output_line)
+        except MCUConfigError:
+            output_line("MCU configuration failed, attempting restart")
+            self.need_upload = True
+            self.mcu_conn.reset()
+            self.task_complete = True
+            return
         self.firmware_checksum = self.mcu_conn.sdcard_upload()
         self.mcu_conn.reset()
         self.task_complete = True
 
     def run_verify(self, eventtime):
         # Reconnect and verify
-        self.mcu_conn.connect()
+        if not self.mcu_conn.connected:
+            self.mcu_conn.connect()
         self.mcu_conn.configure_mcu()
-        self.mcu_conn.verify_flash(self.firmware_checksum)
+        self.mcu_conn.verify_flash(self.firmware_checksum, self.old_dictionary,
+                                   self.new_dictionary)
         self.mcu_conn.reset()
         self.task_complete = True
 
@@ -1055,12 +1170,18 @@ class SPIFlash:
             self.mcu_conn = k_reactor = None
 
     def run(self):
-        self.run_reactor_task(self.run_reset)
-        self._wait_for_reconnect()
-        if self.need_upload:
-            self.run_reactor_task(self.run_sdcard_upload)
+        if not bool(self.board_config.get('verify_only', False)):
+            self.run_reactor_task(self.run_reset_upload)
             self._wait_for_reconnect()
-        self.run_reactor_task(self.run_verify)
+            if self.need_upload:
+                self.run_reactor_task(self.run_sdcard_upload)
+                self._wait_for_reconnect()
+            self.run_reactor_task(self.run_verify)
+        else:
+            self.run_reactor_task(self.run_reset_verify)
+            if self.need_verify:
+                self._wait_for_reconnect()
+                self.run_reactor_task(self.run_verify)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1082,6 +1203,12 @@ def main():
         "-v", "--verbose", action="store_true",
         help="Enable verbose output")
     parser.add_argument(
+        "-d", "--dict_path", metavar="<klipper.dict>", type=str,
+        default=None, help="Klipper firmware dictionary")
+    parser.add_argument(
+        "-c","--check", action="store_true",
+        help="Perform flash check/verify only")
+    parser.add_argument(
         "device", metavar="<device>", help="Device Serial Port")
     parser.add_argument(
         "board", metavar="<board>", help="Board Type")
@@ -1098,6 +1225,11 @@ def main():
     flash_args['device'] = args.device
     flash_args['baud'] = args.baud
     flash_args['klipper_bin_path'] = args.klipper_bin_path
+    flash_args['klipper_dict_path'] = args.dict_path
+    flash_args['verify_only'] = args.check
+    if args.check:
+        # override board_defs setting when doing verify-only:
+        flash_args['skip_verify'] = False
     check_need_convert(args.board, flash_args)
     fatfs_lib.check_fatfs_build(output)
     try:

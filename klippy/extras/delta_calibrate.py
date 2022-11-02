@@ -14,14 +14,7 @@ from . import probe
 
 # Load a stable position from a config entry
 def load_config_stable(config, option):
-    spos = config.get(option)
-    try:
-        sa, sb, sc = map(float, spos.split(','))
-    except:
-        msg = "Unable to parse stable position '%s'" % (spos,)
-        logging.exception(msg)
-        raise config.error(msg)
-    return sa, sb, sc
+    return config.getfloatlist(option, count=3)
 
 
 ######################################################################
@@ -52,7 +45,7 @@ def measurements_to_distances(measured_params, delta_params):
         od - opw
         for od, opw in zip(mp['OUTER_DISTS'], mp['OUTER_PILLAR_WIDTHS']) ]
     # Convert angles in degrees to an XY multiplier
-    obj_angles = map(math.radians, MeasureAngles)
+    obj_angles = list(map(math.radians, MeasureAngles))
     xy_angles = list(zip(map(math.cos, obj_angles), map(math.sin, obj_angles)))
     # Calculate stable positions for center measurements
     inner_ridge = MeasureRidgeRadius * scale
@@ -233,9 +226,9 @@ class DeltaCalibrate:
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
         kin = toolhead.get_kinematics()
-        for s in kin.get_steppers():
-            s.set_tag_position(s.get_commanded_position())
-        kin_pos = kin.calc_tag_position()
+        kin_spos = {s.get_name(): s.get_commanded_position()
+                    for s in kin.get_steppers()}
+        kin_pos = kin.calc_position(kin_spos)
         # Convert location to a stable position
         delta_params = kin.get_calibration()
         stable_pos = tuple(delta_params.calc_stable_position(kin_pos))

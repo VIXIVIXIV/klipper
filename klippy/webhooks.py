@@ -3,8 +3,10 @@
 # Copyright (C) 2020 Eric Callahan <arksine.code@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license
-import logging, socket, os, sys, errno, json
+import logging, socket, os, sys, errno, json, collections
 import gcode
+
+REQUEST_LOG_SIZE = 20
 
 # Json decodes strings as unicode types in Python 2.x.  This doesn't
 # play well with some parts of Klipper (particuarly displays), so we
@@ -12,15 +14,17 @@ import gcode
 #
 # https://stackoverflow.com/questions/956867/
 #
-def byteify(data, ignore_dicts=False):
-    if isinstance(data, unicode):
-        return data.encode('utf-8')
-    if isinstance(data, list):
-        return [byteify(i, True) for i in data]
-    if isinstance(data, dict) and not ignore_dicts:
-        return {byteify(k, True): byteify(v, True)
-                for k, v in data.items()}
-    return data
+json_loads_byteify = None
+if sys.version_info.major < 3:
+    def json_loads_byteify(data, ignore_dicts=False):
+        if isinstance(data, unicode):
+            return data.encode('utf-8')
+        if isinstance(data, list):
+            return [json_loads_byteify(i, True) for i in data]
+        if isinstance(data, dict) and not ignore_dicts:
+            return {json_loads_byteify(k, True): json_loads_byteify(v, True)
+                    for k, v in data.items()}
+        return data
 
 class WebRequestError(gcode.CommandError):
     def __init__(self, message,):
@@ -38,7 +42,7 @@ class WebRequest:
     error = WebRequestError
     def __init__(self, client_conn, request):
         self.client_conn = client_conn
-        base_request = json.loads(request, object_hook=byteify)
+        base_request = json.loads(request, object_hook=json_loads_byteify)
         if type(base_request) != dict:
             raise ValueError("Not a top-level dictionary")
         self.id = base_request.get('id', None)
@@ -119,6 +123,8 @@ class ServerSocket:
             self.sock.fileno(), self._handle_accept)
         printer.register_event_handler(
             'klippy:disconnect', self._handle_disconnect)
+        printer.register_event_handler(
+            "klippy:shutdown", self._handle_shutdown)
 
     def _handle_accept(self, eventtime):
         try:
@@ -139,6 +145,10 @@ class ServerSocket:
             except socket.error:
                 pass
 
+    def _handle_shutdown(self):
+        for client in self.clients.values():
+            client.dump_request_log()
+
     def _remove_socket_file(self, file_path):
         try:
             os.remove(file_path)
@@ -152,6 +162,16 @@ class ServerSocket:
     def pop_client(self, client_id):
         self.clients.pop(client_id, None)
 
+    def stats(self, eventtime):
+        # Called once per second - check for idle clients
+        for client in list(self.clients.values()):
+            if client.is_blocking:
+                client.blocking_count -= 1
+                if client.blocking_count < 0:
+                    logging.info("Closing unresponsive client %s", client.uid)
+                    client.close()
+        return False, ""
+
 class ClientConnection:
     def __init__(self, server, sock):
         self.printer = server.printer
@@ -161,10 +181,20 @@ class ClientConnection:
         self.uid = id(self)
         self.sock = sock
         self.fd_handle = self.reactor.register_fd(
-            self.sock.fileno(), self.process_received)
-        self.partial_data = self.send_buffer = ""
-        self.is_sending_data = False
+            self.sock.fileno(), self.process_received, self._do_send)
+        self.partial_data = self.send_buffer = b""
+        self.is_blocking = False
+        self.blocking_count = 0
         self.set_client_info("?", "New connection")
+        self.request_log = collections.deque([], REQUEST_LOG_SIZE)
+
+    def dump_request_log(self):
+        out = []
+        out.append("Dumping %d requests for client %d"
+                   % (len(self.request_log), self.uid,))
+        for eventtime, request in self.request_log:
+            out.append("Received %f: %s" % (eventtime, request))
+        logging.info("\n".join(out))
 
     def set_client_info(self, client_info, state_msg=None):
         if state_msg is None:
@@ -199,17 +229,18 @@ class ClientConnection:
             # If bad file descriptor allow connection to be
             # closed by the data check
             if e.errno == errno.EBADF:
-                data = ''
+                data = b""
             else:
                 return
-        if data == '':
+        if not data:
             # Socket Closed
             self.close()
             return
-        requests = data.split('\x03')
+        requests = data.split(b'\x03')
         requests[0] = self.partial_data + requests[0]
         self.partial_data = requests.pop()
         for req in requests:
+            self.request_log.append((eventtime, req))
             try:
                 web_request = WebRequest(self, req)
             except Exception:
@@ -237,40 +268,38 @@ class ClientConnection:
         self.send(result)
 
     def send(self, data):
-        self.send_buffer += json.dumps(data) + "\x03"
-        if not self.is_sending_data:
-            self.is_sending_data = True
-            self.reactor.register_callback(self._do_send)
+        jmsg = json.dumps(data, separators=(',', ':'))
+        self.send_buffer += jmsg.encode() + b"\x03"
+        if not self.is_blocking:
+            self._do_send()
 
-    def _do_send(self, eventtime):
-        retries = 10
-        while self.send_buffer:
-            try:
-                sent = self.sock.send(self.send_buffer)
-            except socket.error as e:
-                if e.errno == errno.EBADF or e.errno == errno.EPIPE \
-                        or not retries:
-                    sent = 0
-                else:
-                    retries -= 1
-                    waketime = self.reactor.monotonic() + .001
-                    self.reactor.pause(waketime)
-                    continue
-            retries = 10
-            if sent > 0:
-                self.send_buffer = self.send_buffer[sent:]
-            else:
-                logging.info(
-                    "webhooks: Error sending server data,  closing socket")
+    def _do_send(self, eventtime=None):
+        if self.fd_handle is None:
+            return
+        try:
+            sent = self.sock.send(self.send_buffer)
+        except socket.error as e:
+            if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
+                logging.info("webhooks: socket write error %d" % (self.uid,))
                 self.close()
-                break
-        self.is_sending_data = False
+                return
+            sent = 0
+        if sent < len(self.send_buffer):
+            if not self.is_blocking:
+                self.reactor.set_fd_wake(self.fd_handle, False, True)
+                self.is_blocking = True
+                self.blocking_count = 5
+        elif self.is_blocking:
+            self.reactor.set_fd_wake(self.fd_handle, True, False)
+            self.is_blocking = False
+        self.send_buffer = self.send_buffer[sent:]
 
 class WebHooks:
     def __init__(self, printer):
         self.printer = printer
         self._endpoints = {"list_endpoints": self._handle_list_endpoints}
         self._remote_methods = {}
+        self._mux_endpoints = {}
         self.register_endpoint("info", self._handle_info_request)
         self.register_endpoint("emergency_stop", self._handle_estop_request)
         self.register_endpoint("register_remote_method",
@@ -281,6 +310,33 @@ class WebHooks:
         if path in self._endpoints:
             raise WebRequestError("Path already registered to an endpoint")
         self._endpoints[path] = callback
+
+    def register_mux_endpoint(self, path, key, value, callback):
+        prev = self._mux_endpoints.get(path)
+        if prev is None:
+            self.register_endpoint(path, self._handle_mux)
+            self._mux_endpoints[path] = prev = (key, {})
+        prev_key, prev_values = prev
+        if prev_key != key:
+            raise self.printer.config_error(
+                "mux endpoint %s %s %s may have only one key (%s)"
+                % (path, key, value, prev_key))
+        if value in prev_values:
+            raise self.printer.config_error(
+                "mux endpoint %s %s %s already registered (%s)"
+                % (path, key, value, prev_values))
+        prev_values[value] = callback
+
+    def _handle_mux(self, web_request):
+        key, values = self._mux_endpoints[web_request.get_method()]
+        if None in values:
+            key_param = web_request.get(key, None)
+        else:
+            key_param = web_request.get(key)
+        if key_param not in values:
+            raise web_request.error("The value '%s' is not valid for %s"
+                                    % (key_param, key))
+        values[key_param](web_request)
 
     def _handle_list_endpoints(self, web_request):
         web_request.send({'endpoints': list(self._endpoints.keys())})
@@ -325,6 +381,9 @@ class WebHooks:
     def get_status(self, eventtime):
         state_message, state = self.printer.get_state_message()
         return {'state': state, 'state_message': state_message}
+
+    def stats(self, eventtime):
+        return self.sconn.stats(eventtime)
 
     def call_remote_method(self, method, **kwargs):
         if method not in self._remote_methods:

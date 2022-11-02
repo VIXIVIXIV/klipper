@@ -1,16 +1,16 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 # Generate adxl345 accelerometer graphs
 #
 # Copyright (C) 2020  Kevin O'Connor <kevin@koconnor.net>
 # Copyright (C) 2020  Dmitry Butyugin <dmbutyugin@google.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import optparse, os, sys
+import importlib, optparse, os, sys
 from textwrap import wrap
 import numpy as np, matplotlib
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                             '..', 'klippy', 'extras'))
-from shaper_calibrate import ShaperCalibrate
+                             '..', 'klippy'))
+shaper_calibrate = importlib.import_module('.shaper_calibrate', 'extras')
 
 MAX_TITLE_LENGTH=65
 
@@ -56,7 +56,7 @@ def plot_accel(data, logname):
 
 # Calculate estimated "power spectral density"
 def calc_freq_response(data, max_freq):
-    helper = ShaperCalibrate(printer=None)
+    helper = shaper_calibrate.ShaperCalibrate(printer=None)
     return helper.process_accelerometer_data(data)
 
 def calc_specgram(data, axis):
@@ -82,7 +82,7 @@ def calc_specgram(data, axis):
 def plot_frequency(datas, lognames, max_freq):
     calibration_data = calc_freq_response(datas[0], max_freq)
     for data in datas[1:]:
-        calibration_data.join(calc_freq_response(data, max_freq))
+        calibration_data.add_data(calc_freq_response(data, max_freq))
     freqs = calibration_data.freq_bins
     psd = calibration_data.psd_sum[freqs <= max_freq]
     px = calibration_data.psd_x[freqs <= max_freq]
@@ -155,10 +155,10 @@ def plot_specgram(data, logname, max_freq, axis):
 ######################################################################
 
 def write_frequency_response(datas, output):
-    helper = ShaperCalibrate(printer=None)
+    helper = shaper_calibrate.ShaperCalibrate(printer=None)
     calibration_data = helper.process_accelerometer_data(datas[0])
     for data in datas[1:]:
-        calibration_data.join(helper.process_accelerometer_data(data))
+        calibration_data.add_data(helper.process_accelerometer_data(data))
     helper.save_calibration_data(output, calibration_data)
 
 def write_specgram(psd, freq_bins, time, output):
