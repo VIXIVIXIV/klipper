@@ -283,8 +283,11 @@ class MAX31865(SensorBase):
     def __init__(self, config):
         rtd_nominal_r = config.getfloat('rtd_nominal_r', 100., above=0.)
         rtd_reference_r = config.getfloat('rtd_reference_r', 430., above=0.)
+        #Extra wire resistance, calibrate to 0C ice bath
+        rtd_inline_r = config.getfloat('rtd_inline_r', 0., minval=0.)
         adc_to_resist = rtd_reference_r / float(MAX31865_ADC_MAX)
         self.adc_to_resist_div_nominal = adc_to_resist / rtd_nominal_r
+        self.correction_factor = rtd_inline_r / rtd_nominal_r
         self.config_reg = self.build_spi_init(config)
         SensorBase.__init__(self, config, "MAX31865", self.config_reg)
     def handle_fault(self, adc, fault):
@@ -309,7 +312,7 @@ class MAX31865(SensorBase):
         self.spi.spi_send(self.config_reg)
     def calc_temp(self, adc):
         adc = adc >> 1 # remove fault bit
-        R_div_nominal = adc * self.adc_to_resist_div_nominal
+        R_div_nominal = adc * self.adc_to_resist_div_nominal - self.correction_factor
         # Resistance (relative to rtd_nominal_r) is calculated using:
         #  R_div_nominal = 1. + CVD_A * temp + CVD_B * temp**2
         # Solve for temp using quadratic equation:
