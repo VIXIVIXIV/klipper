@@ -312,7 +312,7 @@ class MAX31865(SensorBase):
         self.spi.spi_send(self.config_reg)
     def calc_temp(self, adc):
         adc = adc >> 1 # remove fault bit
-        R_div_nominal = ( adc * self.adc_to_resist_div_nominal - 
+        R_div_nominal = ( adc * self.adc_to_resist_div_nominal -
         self.correction_factor )
         # Resistance (relative to rtd_nominal_r) is calculated using:
         #  R_div_nominal = 1. + CVD_A * temp + CVD_B * temp**2
