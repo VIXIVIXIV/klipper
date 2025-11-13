@@ -62,7 +62,7 @@ t5uid1_init(uint32_t baud)
 {
     UCSRxA = CONFIG_SERIAL_BAUD_U2X ? (1<<U2Xx) : 0;
     uint32_t cm = CONFIG_SERIAL_BAUD_U2X ? 8 : 16;
-    UBRRx = DIV_ROUND_CLOSEST(CONFIG_CLOCK_FREQ, cm * baud) - 1UL;
+    UBRRx = DIV_ROUND_CLOSEST(CONFIG_CLOCK_FREQ, cm * 250000) - 1UL; //Static baud to test build error
     UCSRxC = (1<<UCSZx1) | (1<<UCSZx0);
     UCSRxB = (1<<RXENx) | (1<<TXENx) | (1<<RXCIEx) | (1<<UDRIEx);
 }
