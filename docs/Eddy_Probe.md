@@ -4,8 +4,10 @@ This document describes how to use an
 [eddy current](https://en.wikipedia.org/wiki/Eddy_current) inductive
 probe in Klipper.
 
-Currently, an eddy current probe can not be used for Z homing. The
-sensor can only be used for Z probing.
+Currently, an eddy current probe can not precisely home Z (i.e., `G28 Z`).
+The sensor can precisely do Z probing (i.e., `PROBE ...`).
+Look at the [homing correction](Eddy_Probe.md#homing-correction-macros)
+for further details.
 
 Start by declaring a
 [probe_eddy_current config section](Config_Reference.md#probe_eddy_current)
@@ -66,6 +68,34 @@ surface temperature or sensor hardware temperature can skew the
 results. It is important that calibration and probing is only done
 when the printer is at a stable temperature.
 
+## Homing correction macros
+
+Because of current limitations, homing and probing
+are implemented differently for the eddy sensors.
+As a result, homing suffers from an offset error,
+while probing handles this correctly.
+
+To correct the homing offset.
+One can use the suggested macro inside the homing override or
+inside the starting G-Code.
+
+[Force move](Config_Reference.md#force_move) section
+have to be defined in the config.
+
+```
+[gcode_macro _RELOAD_Z_OFFSET_FROM_PROBE]
+gcode:
+  {% set Z = printer.toolhead.position.z %}
+  SET_KINEMATIC_POSITION Z={Z - printer.probe.last_probe_position.z}
+
+[gcode_macro SET_Z_FROM_PROBE]
+gcode:
+  {% set METHOD = params.METHOD | default("automatic") %}
+  PROBE METHOD={METHOD}
+  _RELOAD_Z_OFFSET_FROM_PROBE
+  G0 Z5
+```
+
 ## Tap calibration
 
 The Eddy probe measures the resonance frequency of the coil.
@@ -89,7 +119,17 @@ and that upon collision it always decreases by at least this value.
 ```
 [probe_eddy_current my_probe]
 # eddy probe configuration...
-tap_threshold: 0
+# Recommended starting values for the tap
+#samples: 3
+#samples_tolerance: 0.025
+#samples_tolerance_retries: 3
+tap_threshold: 0 # 0 means tap is disabled
+```
+
+Before setting it to any other value, it is necessary to install `scipy`:
+
+```bash
+~/klippy-env/bin/pip install scipy
 ```
 
 The suggested calibration routine works as follows:
@@ -135,6 +175,11 @@ The estimation will be:
 MAD_Hz * 2
 11.314 * 2 = 22.628
 ```
+
+To further fine tune threshold, one can use `PROBE_ACCURACY METHOD=tap`.
+The range is expected to be about 0.02 mm,
+with the default probe speed of 5 mm/s.
+Elevated coil temperature may increase noise and may require additional tuning.
 
 You can validate the tap precision by measuring the paper thickness
 from the initial calibration guide. It is expected to be ~0.1mm.
