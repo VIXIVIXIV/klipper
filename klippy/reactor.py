@@ -1,6 +1,6 @@
 # File descriptor and timer event helper
 #
-# Copyright (C) 2016-2025  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2016-2026  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os, gc, select, math, time, logging, queue
@@ -109,7 +109,7 @@ class SelectReactor:
         self._process = False
         self.monotonic = chelper.get_ffi()[1].get_monotonic
         # Python garbage collection
-        self._check_gc = gc_checking
+        self._gc_checking = gc_checking
         self._last_gc_times = [0., 0., 0.]
         # Timers
         self._timers = []
@@ -127,11 +127,27 @@ class SelectReactor:
         self._WRITE = 2
         # Greenlets
         self._g_dispatch = None
-        self._greenlets = []
+        self._cached_dispatch_greenlets = []
         self._all_greenlets = []
         self._prevent_pause_count = 0
+    # Python garbage collection
     def get_gc_stats(self):
         return tuple(self._last_gc_times)
+    def _check_gc(self, eventtime):
+        if not self._gc_checking:
+            return False
+        gi = gc.get_count()
+        if gi[0] < 700:
+            return False
+        # Reactor looks idle and gc is due - run it
+        gc_level = 0
+        if gi[1] >= 10:
+            gc_level = 1
+            if gi[2] >= 10:
+                gc_level = 2
+        self._last_gc_times[gc_level] = eventtime
+        gc.collect(gc_level)
+        return True
     # Timers
     def update_timer(self, timer_handler, waketime):
         if timer_handler.timer_is_running:
@@ -154,18 +170,9 @@ class SelectReactor:
         if eventtime < self._next_timer:
             if busy:
                 return 0.
-            if self._check_gc:
-                gi = gc.get_count()
-                if gi[0] >= 700:
-                    # Reactor looks idle and gc is due - run it
-                    gc_level = 0
-                    if gi[1] >= 10:
-                        gc_level = 1
-                        if gi[2] >= 10:
-                            gc_level = 2
-                    self._last_gc_times[gc_level] = eventtime
-                    gc.collect(gc_level)
-                    return 0.
+            gc_busy = self._check_gc(eventtime)
+            if gc_busy:
+                return 0.
             return min(1., max(.001, self._next_timer - eventtime))
         self._next_timer = self.NEVER
         g_dispatch = self._g_dispatch
@@ -240,9 +247,9 @@ class SelectReactor:
         # Pausing the dispatch greenlet - setup timer to resume this greenlet
         g.timer = self.register_timer(g.switch, waketime)
         self._next_timer = self.NOW
-        if self._greenlets:
+        if self._cached_dispatch_greenlets:
             # Switch to _end_greenlet to activate cached dispatch greenlet
-            g_next = self._greenlets.pop()
+            g_next = self._cached_dispatch_greenlets.pop()
             eventtime = g_next.switch()
         else:
             # No cached greenlets, switch to run() to create new dispatcher
@@ -250,10 +257,12 @@ class SelectReactor:
         # This greenlet activated from g.timer.callback (via _check_timers)
         return eventtime
     def _end_greenlet(self, g_old):
-        # Cache this greenlet for later use
-        self._greenlets.append(g_old)
+        # A timer/io event that called pause() has completed.
+        # Cleanup the internal timer associated with this greenlet.
         self.unregister_timer(g_old.timer)
         g_old.timer = None
+        # Cache this greenlet for later use
+        self._cached_dispatch_greenlets.append(g_old)
         # Switch to _check_timers (via g_old.timer.callback return)
         self._g_dispatch.switch(self.NEVER)
         # This greenlet reactivated from pause() - return to main dispatch loop
@@ -336,7 +345,7 @@ class SelectReactor:
         self._process = False
     def finalize(self):
         self._g_dispatch = None
-        self._greenlets = []
+        self._cached_dispatch_greenlets = []
         for g in self._all_greenlets:
             try:
                 g.throw()
