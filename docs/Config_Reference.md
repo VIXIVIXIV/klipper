@@ -1794,8 +1794,9 @@ the [command reference](G-Codes.md#input_shaper).
 #   value is 0, which disables input shaping for Z axis.
 #shaper_type: mzv
 #   A type of the input shaper to use for all axes. Supported
-#   shapers are zv, mzv, zvd, ei, 2hump_ei, and 3hump_ei. The default
-#   is mzv input shaper.
+#   shapers are zv, mzv, zvd, ei, 2hump_ei, and 3hump_ei. Some shapers
+#   support optional additional parameters, e.g. mzv(n=4,t=0.9) or
+#   ei(v_tol=0.1). The default is mzv input shaper (without parameters).
 #shaper_type_x:
 #shaper_type_y:
 #shaper_type_z:
@@ -2322,6 +2323,12 @@ sensor_type: ldc1612
 #intb_pin:
 #   MCU gpio pin connected to the ldc1612 sensor's INTB pin (if
 #   available). The default is to not use the INTB pin.
+#max_sensor_hz:
+#   Maximum expected resonant frequency reported by the sensor (in
+#   Hz). This is used during internal clock rate configuration. This
+#   value is typically only configured if the software reports a
+#   warning suggesting the value should be increased. The default is
+#   5000000.
 #descend_z:
 #   The nominal distance (in mm) between the nozzle and bed that a
 #   probing attempt should stop at. This parameter must be provided.
@@ -2349,15 +2356,13 @@ sensor_type: ldc1612
 #   settings do not have an effect if using a probe "METHOD" of
 #   "scan", "rapid_scan", or "tap".
 #tap_threshold:
-#   Noise cutoff/stop trigger threshold (in Hz). Specify this value to
-#   enable support for "METHOD=tap" probe commands. See Eddy_Probe.md
-#   for more information. Larger values make the tap detection less
-#   sensitive. That is, larger values make it less likely the toolhead
-#   will incorrectly stop early due to noise, while increasing the
-#   risk of the toolhead not correctly stopping when it first contacts
-#   the bed. If this value is specified then one may override its
-#   value at run-time using the "TAP_THRESHOLD" parameter on probe
-#   commands. The default is to not enable support for "tap" probing.
+#   Descent stop threshold (in Hz/mm) for "tap" probing. Larger values
+#   reduce the chance of the toolhead incorrectly stopping early due
+#   to noise, while increasing the risk of the toolhead not correctly
+#   stopping when it first contacts the bed. See Eddy_Probe.md for
+#   more information. This value may be overridden at run-time using
+#   the "TAP_THRESHOLD" parameter on probe commands.  The default is
+#   to not enable "tap" probing.
 #tap_z_offset: 0.0
 #   The Z height (in mm) of the nozzle relative to the bed at the
 #   contact point detected during "tap" probing. Nominally this would
